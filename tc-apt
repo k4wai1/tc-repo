@@ -1,0 +1,188 @@
+#!/bin/sh
+# tc-apt: Gestor de paquetes multi-repo para Tiny Core Linux
+
+TCE_DIR="/etc/sysconfig/tcedir/optional"
+ONBOOT_LST="/etc/sysconfig/tcedir/onboot.lst"
+REPOS="https://k4wai1.github.io/tc-repo http://distro.ibiblio.org/tinycorelinux"
+TC_VER="$(version | awk -F. '{print $1}').x"
+TC_ARCH="$(uname -m)"
+LISTS_DIR="/tmp/tc-apt-lists"
+
+# --- FUNCIÓN: DESCARGA RECURSIVA ---
+# (La misma función que hicimos antes para dependencias)
+descargar_paquete() {
+    local PKG="$1"
+    
+    if [ -f "$TCE_DIR/$PKG" ]; then
+        echo " [+] $PKG ya está en disco. Saltando..."
+        return 0
+    fi
+
+    local ENCONTRADO=0
+    for REPO in $REPOS; do
+        URL_BASE="$REPO/$TC_VER/$TC_ARCH/tcz"
+        wget -q -O "$TCE_DIR/$PKG.md5.txt" "$URL_BASE/$PKG.md5.txt"
+        
+        if [ $? -eq 0 ]; then
+            echo " [↓] Descargando $PKG desde $REPO..."
+            wget -q -O "$TCE_DIR/$PKG" "$URL_BASE/$PKG"
+            wget -q -O "$TCE_DIR/$PKG.dep" "$URL_BASE/$PKG.dep" 2>/dev/null
+            ENCONTRADO=1
+            break
+        fi
+    done
+
+    if [ $ENCONTRADO -eq 0 ]; then
+        echo " [!] ERROR: No se encontró $PKG en ningún repositorio."
+        exit 1
+    fi
+
+    if [ -f "$TCE_DIR/$PKG.dep" ]; then
+        while read -r DEP_PKG; do
+            DEP_PKG=$(echo "$DEP_PKG" | tr -d '\r')
+            if [ -n "$DEP_PKG" ]; then
+                descargar_paquete "$DEP_PKG"
+            fi
+        done < "$TCE_DIR/$PKG.dep"
+    fi
+}
+
+# --- AYUDANTE: AUTOCOMPLETAR .tcz ---
+formatear_nombre() {
+    case "$1" in
+        *.tcz) echo "$1" ;;
+        *)     echo "$1.tcz" ;;
+    esac
+}
+
+# --- ESTRUCTURA PRINCIPAL ---
+ACCION="$1"
+PARAMETRO="$2"
+
+case "$ACCION" in
+    update)
+        echo "Actualizando listas de repositorios..."
+        mkdir -p "$LISTS_DIR"
+        
+        # Contador para nombrar los archivos (ej. repo1.lst, repo2.lst)
+        COUNT=1
+        for REPO in $REPOS; do
+            echo " -> Descargando índice de $REPO..."
+            wget -q -O "$LISTS_DIR/repo${COUNT}.lst" "$REPO/$TC_VER/$TC_ARCH/tcz/info.lst"
+            COUNT=$((COUNT + 1))
+        done
+        echo "¡Listas actualizadas! (Usa 'search' para buscar)"
+        ;;
+        
+    search)
+        if [ -z "$PARAMETRO" ]; then
+            echo "Error: Escribe un término para buscar."
+            exit 1
+        fi
+        if [ ! -d "$LISTS_DIR" ]; then
+            echo "Las listas no existen. Ejecuta '$0 update' primero."
+            exit 1
+        fi
+        
+        echo "Resultados para '$PARAMETRO':"
+        echo "--------------------------------"
+        # Busca ignorando mayúsculas/minúsculas (-i) en todas las listas
+        grep -i "$PARAMETRO" "$LISTS_DIR"/*.lst | awk -F: '{print $2}' | sort | uniq
+        echo "--------------------------------"
+        ;;
+
+    install)
+        if [ -z "$PARAMETRO" ]; then
+            echo "Error: Debes especificar un paquete."
+            exit 1
+        fi
+        
+        PKG_FINAL=$(formatear_nombre "$PARAMETRO")
+        echo "--- Preparando instalación de: $PKG_FINAL ---"
+        descargar_paquete "$PKG_FINAL"
+        
+        # Agregamos a onboot.lst para que inicie con el sistema (si no está ya)
+        grep -q "^$PKG_FINAL\$" "$ONBOOT_LST" || echo "$PKG_FINAL" >> "$ONBOOT_LST"
+        
+        echo "--- Cargando en memoria RAM ---"
+        tce-load -i "$PKG_FINAL"
+        echo "¡Instalación completada!"
+        ;;
+
+    remove)
+        if [ -z "$PARAMETRO" ]; then
+            echo "Error: Especifica el paquete a eliminar."
+            exit 1
+        fi
+        
+        PKG_FINAL=$(formatear_nombre "$PARAMETRO")
+        echo "Eliminando $PKG_FINAL del disco..."
+        
+        # 1. Borrar los archivos físicos
+        rm -f "$TCE_DIR/$PKG_FINAL"*
+        # 2. Quitar de la lista de arranque automático
+        sed -i "/^$PKG_FINAL\$/d" "$ONBOOT_LST"
+        
+        echo "¡Eliminado del almacenamiento local!"
+        echo "[!] NOTA: El programa sigue cargado en la RAM. Reinicia el equipo para liberarlo completamente."
+        ;;
+
+    upgrade)
+        if [ -z "$PARAMETRO" ]; then
+            echo "Error: Especifica el paquete a actualizar."
+            exit 1
+        fi
+        
+        PKG_FINAL=$(formatear_nombre "$PARAMETRO")
+        
+        if [ ! -f "$TCE_DIR/$PKG_FINAL" ]; then
+            echo "Error: El paquete $PKG_FINAL no está instalado localmente."
+            exit 1
+        fi
+        
+        echo "Comprobando actualizaciones para $PKG_FINAL..."
+        
+        # Guardamos el MD5 actual
+        MD5_LOCAL=$(cat "$TCE_DIR/$PKG_FINAL.md5.txt" 2>/dev/null | awk '{print $1}')
+        
+        ACTUALIZADO=0
+        for REPO in $REPOS; do
+            URL_BASE="$REPO/$TC_VER/$TC_ARCH/tcz"
+            
+            # Descargamos el MD5 remoto a un archivo temporal
+            wget -q -O "/tmp/temp.md5" "$URL_BASE/$PKG_FINAL.md5.txt"
+            
+            if [ $? -eq 0 ]; then
+                MD5_REMOTO=$(cat "/tmp/temp.md5" | awk '{print $1}')
+                
+                if [ "$MD5_LOCAL" != "$MD5_REMOTO" ]; then
+                    echo "¡Nueva versión encontrada en $REPO!"
+                    echo "Descargando actualización..."
+                    
+                    # Borramos el viejo y descargamos el nuevo
+                    rm -f "$TCE_DIR/$PKG_FINAL"*
+                    wget -q -O "$TCE_DIR/$PKG_FINAL.md5.txt" "$URL_BASE/$PKG_FINAL.md5.txt"
+                    wget -q -O "$TCE_DIR/$PKG_FINAL" "$URL_BASE/$PKG_FINAL"
+                    wget -q -O "$TCE_DIR/$PKG_FINAL.dep" "$URL_BASE/$PKG_FINAL.dep" 2>/dev/null
+                    
+                    echo "¡Actualización descargada en disco!"
+                    echo "[!] NOTA: Reinicia el equipo para cargar la nueva versión en RAM."
+                else
+                    echo "$PKG_FINAL ya está en su última versión."
+                fi
+                ACTUALIZADO=1
+                break
+            fi
+        done
+        
+        if [ $ACTUALIZADO -eq 0 ]; then
+            echo "No se encontró información en los servidores."
+        fi
+        rm -f "/tmp/temp.md5"
+        ;;
+
+    *)
+        echo "tc-apt - Gestor Multi-Repo para Tiny Core"
+        echo "Uso: $0 {update|search|install|remove|upgrade} [paquete]"
+        ;;
+esac
