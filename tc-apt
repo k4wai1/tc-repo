@@ -6,24 +6,27 @@ ONBOOT_LST="/etc/sysconfig/tcedir/onboot.lst"
 REPOS="https://k4wai1.github.io/tc-repo http://distro.ibiblio.org/tinycorelinux"
 TC_VER="$(version | awk -F. '{print $1}').x"
 TC_ARCH="$(uname -m)"
+
+# Directorios de trabajo
 LISTS_DIR="/tmp/tc-apt-lists"
+TMP_DL_DIR="/tmp/tc-apt-dl" # <--- Nuevo espacio de trabajo temporal
 
 # Códigos de color para mejorar la UX
 C_OK="\033[1;32m"
-C_INFO="\033[1;34m"
+C_INFO="\033[1;36m"   # Cyan para pasos
 C_WARN="\033[1;33m"
 C_ERR="\033[1;31m"
 C_RESET="\033[0m"
 
+# Asegurar que el directorio temporal exista
+mkdir -p "$TMP_DL_DIR"
+
 # --- FUNCIÓN: BUSCAR REPO LOCALMENTE ---
-# Busca en qué repositorio está el paquete leyendo los índices locales
 encontrar_repo_de_paquete() {
     local PKG="$1"
     local COUNT=1
-    
     for REPO in $REPOS; do
         if [ -f "$LISTS_DIR/repo${COUNT}.lst" ]; then
-            # Si el paquete está en la lista de este repo, devolvemos la URL
             if grep -qx "$PKG" "$LISTS_DIR/repo${COUNT}.lst" 2>/dev/null; then
                 echo "$REPO"
                 return 0
@@ -38,56 +41,78 @@ encontrar_repo_de_paquete() {
 descargar_paquete() {
     local PKG="$1"
     
-    if [ -f "$TCE_DIR/$PKG" ]; then
-        echo -e "${C_WARN} [~] $PKG ya está en disco. Saltando...${C_RESET}"
-        return 0
+    echo -e "\n${C_INFO}============================================${C_RESET}"
+    echo -e "${C_INFO} PROCESANDO: $PKG ${C_RESET}"
+    echo -e "${C_INFO}============================================${C_RESET}"
+
+    # 0. Comprobar si ya existe y está sano en la carpeta final
+    if [ -f "$TCE_DIR/$PKG" ] && [ -f "$TCE_DIR/$PKG.md5.txt" ]; then
+        if (cd "$TCE_DIR" && md5sum -c "$PKG.md5.txt" > /dev/null 2>&1); then
+            echo -e "${C_OK} [✓] PASO 0: $PKG ya está instalado y validado. Saltando...${C_RESET}"
+            return 0
+        fi
     fi
 
-    # 1. Determinar el repositorio SIN hacer peticiones web
+    # 1. Determinar el repositorio
+    echo -e "${C_INFO} [*] PASO 1: Buscando en qué repositorio está...${C_RESET}"
     local REPO_ORIGEN=$(encontrar_repo_de_paquete "$PKG")
     
     if [ -z "$REPO_ORIGEN" ]; then
-        echo -e "${C_ERR} [!] ERROR: No se encontró '$PKG' en las listas locales. ¿Ejecutaste 'update'?${C_RESET}"
+        echo -e "${C_ERR} [!] ERROR: No se encontró '$PKG' en los índices locales.${C_RESET}"
         exit 1
     fi
-
+    echo "  -> Encontrado en: $REPO_ORIGEN"
     local URL_BASE="$REPO_ORIGEN/$TC_VER/$TC_ARCH/tcz"
 
-    echo -e "${C_INFO} [↓] Descargando $PKG desde $REPO_ORIGEN...${C_RESET}"
+	# 2. Descargar a espacio temporal (/tmp)
+    echo -e "${C_INFO} [*] PASO 2: Descargando al espacio temporal (/tmp)...${C_RESET}"
+    rm -f "$TMP_DL_DIR/$PKG"*
     
-    # 2. Descargar MD5 y .DEP de forma silenciosa
-    wget -q -O "$TCE_DIR/$PKG.md5.txt" "$URL_BASE/$PKG.md5.txt"
-    wget -q -O "$TCE_DIR/$PKG.dep" "$URL_BASE/$PKG.dep" 2>/dev/null
+    echo "  -> Obteniendo metadata (MD5, dependencias)..."
+    # Añadimos -T 5 (5 segundos de espera max) y -t 3 (3 intentos)
+    wget -q -T 5 -t 3 -O "$TMP_DL_DIR/$PKG.md5.txt" "$URL_BASE/$PKG.md5.txt"
+    wget -q -T 5 -t 3 -O "$TMP_DL_DIR/$PKG.dep" "$URL_BASE/$PKG.dep" 2>/dev/null
     
-    # 3. Descargar el paquete CON barra de progreso (sin el flag -q)
-    wget -O "$TCE_DIR/$PKG" "$URL_BASE/$PKG"
+    echo "  -> Descargando el archivo principal..."
+    # Añadimos las mismas banderas de timeout y reintentos aquí
+    wget -T 5 -t 3 -O "$TMP_DL_DIR/$PKG" "$URL_BASE/$PKG"
     
-    if [ $? -ne 0 ]; then
-        echo -e "${C_ERR} [!] ERROR crítico al descargar $PKG. Abortando.${C_RESET}"
-        rm -f "$TCE_DIR/$PKG"* # Limpiar basura
+    if [ $? -ne 0 ] || [ ! -s "$TMP_DL_DIR/$PKG" ]; then
+        echo -e "${C_ERR} [!] ERROR de conexión al descargar $PKG. Abortando.${C_RESET}"
+        rm -f "$TMP_DL_DIR/$PKG"*
         exit 1
     fi
 
-    # 4. Validar el MD5
-    if [ -f "$TCE_DIR/$PKG.md5.txt" ]; then
-        cd "$TCE_DIR" || exit 1
-        if ! md5sum -c "$PKG.md5.txt" > /dev/null 2>&1; then
+    # 3. Validar MD5 en /tmp antes de tocar el sistema
+    echo -e "${C_INFO} [*] PASO 3: Verificando integridad del archivo...${C_RESET}"
+    if [ -f "$TMP_DL_DIR/$PKG.md5.txt" ]; then
+        if ! (cd "$TMP_DL_DIR" && md5sum -c "$PKG.md5.txt" > /dev/null 2>&1); then
             echo -e "${C_ERR} [!] ERROR: La suma MD5 de $PKG no coincide. Archivo corrupto.${C_RESET}"
-            rm -f "$TCE_DIR/$PKG"*
+            rm -f "$TMP_DL_DIR/$PKG"*
             exit 1
         fi
-        cd - > /dev/null
+        echo -e "${C_OK}  -> ¡Integridad confirmada!${C_RESET}"
+    else
+        echo -e "${C_WARN}  -> Advertencia: El servidor no proporcionó MD5.${C_RESET}"
     fi
+
+    # 4. Mover al almacenamiento definitivo
+    echo -e "${C_INFO} [*] PASO 4: Guardando paquete en el sistema local...${C_RESET}"
+    mv "$TMP_DL_DIR/$PKG"* "$TCE_DIR/"
+    echo "  -> Guardado en $TCE_DIR"
 
     # 5. Resolver dependencias recursivamente
     if [ -f "$TCE_DIR/$PKG.dep" ]; then
+        echo -e "${C_INFO} [*] PASO 5: Comprobando dependencias...${C_RESET}"
         while read -r DEP_PKG; do
-            DEP_PKG=$(echo "$DEP_PKG" | tr -d '\r') # Limpiar saltos de línea de Windows/Linux
+            DEP_PKG=$(echo "$DEP_PKG" | tr -d '\r')
             if [ -n "$DEP_PKG" ]; then
-                echo -e "${C_INFO} [+] Resolviendo dependencia: $DEP_PKG${C_RESET}"
+                # Llamada recursiva (repetirá todo este proceso visual para la dependencia)
                 descargar_paquete "$DEP_PKG"
             fi
         done < "$TCE_DIR/$PKG.dep"
+    else
+        echo "  -> Sin dependencias adicionales."
     fi
 }
 
@@ -111,8 +136,8 @@ case "$ACCION" in
         COUNT=1
         for REPO in $REPOS; do
             echo " -> Descargando índice de $REPO..."
-            # Descargamos directamente la info, asumiendo que el server la provee
-            if wget -q -O "$LISTS_DIR/repo${COUNT}.lst" "$REPO/$TC_VER/$TC_ARCH/tcz/info.lst"; then
+            # En la sección update, cámbialo a:
+                if wget -q -T 5 -t 3 -O "$LISTS_DIR/repo${COUNT}.lst" "$REPO/$TC_VER/$TC_ARCH/tcz/info.lst"; then
                 echo -e "${C_OK}    OK: repo${COUNT}.lst (${REPO})${C_RESET}"
             else
                 echo -e "${C_ERR}    Fallo al contactar: $REPO${C_RESET}"
@@ -134,7 +159,6 @@ case "$ACCION" in
         
         echo -e "${C_INFO}Resultados para '$PARAMETRO':${C_RESET}"
         echo "--------------------------------"
-        # Muestra solo el nombre del paquete quitando el prefijo del archivo
         grep -ih "$PARAMETRO" "$LISTS_DIR"/*.lst | sort | uniq
         echo "--------------------------------"
         ;;
@@ -145,21 +169,22 @@ case "$ACCION" in
             exit 1
         fi
         
-        # Obliga a tener las listas para no buscar a ciegas en internet
         if [ ! -d "$LISTS_DIR" ]; then
             echo -e "${C_WARN}Advertencia: Índices no encontrados. Ejecutando 'update' automáticamente...${C_RESET}"
-            $0 update
+            sh "$0" update
         fi
 
         PKG_FINAL=$(formatear_nombre "$PARAMETRO")
-        echo -e "${C_INFO}--- Preparando instalación de: $PKG_FINAL ---${C_RESET}"
+        
+        # Inicia el proceso recursivo principal
         descargar_paquete "$PKG_FINAL"
         
+        # Una vez descargado todo (el principal y dependencias), lo metemos en el onboot
+        echo -e "\n${C_INFO} [*] PASO FINAL: Configurando arranque y cargando en RAM...${C_RESET}"
         grep -q "^$PKG_FINAL\$" "$ONBOOT_LST" || echo "$PKG_FINAL" >> "$ONBOOT_LST"
         
-        echo -e "${C_INFO}--- Cargando en memoria RAM ---${C_RESET}"
         tce-load -i "$PKG_FINAL"
-        echo -e "${C_OK}¡Instalación completada!${C_RESET}"
+        echo -e "${C_OK}\n¡Instalación de $PKG_FINAL completada exitosamente!${C_RESET}"
         ;;
 
     remove)
@@ -178,14 +203,8 @@ case "$ACCION" in
         echo -e "${C_WARN}[!] NOTA: El programa sigue en la RAM. Reinicia para liberarlo completamente.${C_RESET}"
         ;;
 
-    upgrade)
-        # Puedes aplicar una lógica similar a la de 'install' aquí, 
-        # buscando primero la URL base desde las listas actualizadas.
-        echo -e "${C_WARN}Función upgrade pendiente de optimizar con la nueva lógica local.${C_RESET}"
-        ;;
-
     *)
         echo "tc-apt - Gestor Multi-Repo para Tiny Core"
-        echo "Uso: $0 {update|search|install|remove|upgrade} [paquete]"
+        echo "Uso: $0 {update|search|install|remove} [paquete]"
         ;;
 esac
