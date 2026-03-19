@@ -1,1 +1,1 @@
-7dea812cb52426747495dbeb2c4808de  alacritty.tcz
+d9c8b50badd1c272db3a6ec03c78d63d  alacritty.tcz
