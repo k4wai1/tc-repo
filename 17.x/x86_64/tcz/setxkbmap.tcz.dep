@@ -1,0 +1,8 @@
+libxkbfile.tcz
+libX11.tcz
+libXrandr.tcz
+libxcb.tcz
+libXau.tcz
+libXdmcp.tcz
+libXext.tcz
+libXrender.tcz
